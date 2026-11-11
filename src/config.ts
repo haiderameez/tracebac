@@ -1,6 +1,7 @@
-import type { Role } from './types.ts';
+import type { Role, Volatility } from './types.ts';
 
 export type ProviderId = 'groq' | 'cerebras' | 'gemini' | 'openrouter';
+export type SearchId = 'tavily' | 'exa' | 'serper';
 
 export interface Provider {
   baseURL: string;
@@ -49,38 +50,88 @@ export const PROVIDERS: Record<ProviderId, Provider> = {
   },
 };
 
-const OPENROUTER_MODEL = 'baidu/ernie-5.5-flash-preview:free';
-const groqOss = { temperature: 0.2, reasoning_effort: 'low', include_reasoning: false };
-const cerebrasOss = { temperature: 0.2, reasoning_effort: 'low' };
-const gemini = { reasoning_effort: 'low' };
+const OPENROUTER_SLOTS: Slot[] = [
+  'baidu/ernie-5.5-flash-preview:free',
+  'nvidia/nemotron-3.5-lightning:free',
+  'cohere/north-mini-code:free',
+].map((model) => ({ provider: 'openrouter', model, extra: { temperature: 0.2 } }));
+const OUTPUT_CAP: Record<Role, number> = { route: 1000, structure: 4000, write: 2000 };
+
+const groq = (model: string, role: Role): Slot => ({
+  provider: 'groq',
+  model,
+  extra: { temperature: 0.2, reasoning_effort: 'low', include_reasoning: false, max_completion_tokens: OUTPUT_CAP[role] },
+});
+const cerebras = (model: string, role: Role): Slot => {
+  const oss = model === 'gpt-oss-120b';
+  return {
+    provider: 'cerebras',
+    model,
+    extra: { temperature: 0.2, max_completion_tokens: OUTPUT_CAP[role] * (oss ? 1 : 2), ...(oss ? { reasoning_effort: 'low' } : {}) },
+  };
+};
+const gemini = (model: string): Slot => ({ provider: 'gemini', model, extra: { reasoning_effort: 'low' } });
 
 export const CHAINS: Record<Role, Slot[]> = {
   route: [
-    { provider: 'groq', model: 'openai/gpt-oss-20b', extra: groqOss },
-    { provider: 'gemini', model: 'gemini-3.5-flash-lite', extra: gemini },
-    { provider: 'cerebras', model: 'qwen-3.8-27b', extra: { temperature: 0.2 } },
-    { provider: 'openrouter', model: OPENROUTER_MODEL, extra: { temperature: 0.2 } },
+    groq('openai/gpt-oss-20b', 'route'),
+    cerebras('gpt-oss-120b', 'route'),
+    gemini('gemini-3.5-flash-lite'),
+    ...OPENROUTER_SLOTS,
   ],
   structure: [
-    { provider: 'cerebras', model: 'gpt-oss-120b', extra: cerebrasOss },
-    { provider: 'gemini', model: 'gemini-3.8-flash', extra: gemini },
-    { provider: 'groq', model: 'openai/gpt-oss-120b', extra: groqOss },
-    { provider: 'groq', model: 'openai/gpt-oss-20b', extra: groqOss },
-    { provider: 'openrouter', model: OPENROUTER_MODEL, extra: { temperature: 0.2 } },
+    cerebras('gpt-oss-120b', 'structure'),
+    cerebras('qwen-3.8-27b', 'structure'),
+    gemini('gemini-3.8-flash'),
+    groq('openai/gpt-oss-120b', 'structure'),
+    groq('openai/gpt-oss-20b', 'structure'),
+    ...OPENROUTER_SLOTS,
   ],
   write: [
-    { provider: 'gemini', model: 'gemini-3.8-flash', extra: gemini },
-    { provider: 'cerebras', model: 'gpt-oss-120b', extra: cerebrasOss },
-    { provider: 'groq', model: 'openai/gpt-oss-120b', extra: groqOss },
-    { provider: 'groq', model: 'openai/gpt-oss-20b', extra: groqOss },
-    { provider: 'openrouter', model: OPENROUTER_MODEL, extra: { temperature: 0.2 } },
+    gemini('gemini-3.8-flash'),
+    cerebras('gpt-oss-120b', 'write'),
+    cerebras('qwen-3.8-27b', 'write'),
+    groq('openai/gpt-oss-120b', 'write'),
+    groq('openai/gpt-oss-20b', 'write'),
+    ...OPENROUTER_SLOTS,
   ],
 };
 
-const KEY_PRIORITY: ProviderId[] = ['groq', 'cerebras', 'gemini', 'openrouter'];
+export const SEARCH_PROVIDERS: Record<SearchId, { keyEnv: string; signup: string }> = {
+  tavily: { keyEnv: 'TAVILY_API_KEY', signup: 'https://app.tavily.com' },
+  exa: { keyEnv: 'EXA_API_KEY', signup: 'https://dashboard.exa.ai' },
+  serper: { keyEnv: 'SERPER_API_KEY', signup: 'https://serper.dev' },
+};
+
+export const SEARCH_ORDER: SearchId[] = ['tavily', 'exa', 'serper'];
+const MODEL_ORDER: ProviderId[] = ['groq', 'cerebras', 'gemini', 'openrouter'];
+
+export const BUDGET = {
+  searches: 6,
+  reads: 6,
+  concurrency: 5,
+  perSearchMs: 6000,
+  perReadMs: 8000,
+  softDeadlineMs: 12000,
+  evidenceTokens: 4000,
+  maxChunks: 10,
+  chunkChars: 1200,
+  readWant: 3,
+  readGraceMs: 2500,
+  extractRetryMs: 15000,
+  writeWaitMs: 25000,
+};
+
+export const FRESH_MS: Record<Volatility, number> = {
+  fast: 30 * 60 * 1000,
+  slow: 24 * 60 * 60 * 1000,
+  static: 7 * 24 * 60 * 60 * 1000,
+};
 
 export interface Config {
   keys: Partial<Record<ProviderId, string>>;
+  search: Partial<Record<SearchId, string>>;
+  jina?: string;
   port: number;
   allowClockOverride: boolean;
 }
@@ -88,21 +139,29 @@ export interface Config {
 export class ConfigError extends Error {}
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
+  const read = (name: string) => env[name]?.trim() || undefined;
+
   const keys: Partial<Record<ProviderId, string>> = {};
-  for (const id of Object.keys(PROVIDERS) as ProviderId[]) {
-    const value = env[PROVIDERS[id].keyEnv]?.trim();
+  for (const id of MODEL_ORDER) {
+    const value = read(PROVIDERS[id].keyEnv);
     if (value) keys[id] = value;
   }
+  const search: Partial<Record<SearchId, string>> = {};
+  for (const id of SEARCH_ORDER) {
+    const value = read(SEARCH_PROVIDERS[id].keyEnv);
+    if (value) search[id] = value;
+  }
 
-  if (!KEY_PRIORITY.some((id) => keys[id])) {
-    const lines = KEY_PRIORITY.map((id) => `  ${PROVIDERS[id].keyEnv.padEnd(18)} ${PROVIDERS[id].signup}`);
-    throw new ConfigError(
-      ['no model api key found. put at least one of these in .env (all free, no card):', ...lines, '', 'see .env.example'].join('\n'),
-    );
+  const lines = (items: { keyEnv: string; signup: string }[]) => items.map((p) => `  ${p.keyEnv.padEnd(18)} ${p.signup}`);
+  const missing: string[] = [];
+  if (!Object.keys(keys).length) missing.push('a model key, at least one of:', ...lines(MODEL_ORDER.map((id) => PROVIDERS[id])), '');
+  if (!Object.keys(search).length) missing.push('a search key, at least one of:', ...lines(SEARCH_ORDER.map((id) => SEARCH_PROVIDERS[id])), '');
+  if (missing.length) {
+    throw new ConfigError(['missing api keys. put these in .env (all free, no card), see .env.example', '', ...missing].join('\n').trimEnd());
   }
 
   const port = Number(env.PORT ?? 3000);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new ConfigError(`PORT must be a number between 1 and 65535, got "${env.PORT}"`);
 
-  return { keys, port, allowClockOverride: env.ALLOW_CLOCK_OVERRIDE === 'true' };
+  return { keys, search, jina: read('JINA_API_KEY'), port, allowClockOverride: env.ALLOW_CLOCK_OVERRIDE === 'true' };
 }

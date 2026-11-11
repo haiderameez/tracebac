@@ -131,4 +131,15 @@ export type TurnEvent =
   | { type: 'status'; text: string }
   | { type: 'recall'; label: string; quotes: string[]; entities: string[] }
   | { type: 'delta'; text: string }
+  | { type: 'sources'; items: { n: number; url: string; title: string; checkedAt: number }[] }
   | { type: 'done'; turnId: number; route: Route | null; timings: Record<string, number> };
+
+export interface EvidenceItem {
+  n: number;
+  url: string;
+  title: string;
+  text: string;
+  via: 'page' | 'snippet';
+  fetchedAt: number;
+  publishedAt?: number;
+}

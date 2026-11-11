@@ -1,7 +1,8 @@
 import { readFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { z } from 'zod';
-import { runTurn, type Deps } from './pipeline.ts';
+import { runTurn } from './pipeline.ts';
+import type { Deps } from './turn.ts';
 import { fixedClock } from './time.ts';
 
 const Body = z.object({

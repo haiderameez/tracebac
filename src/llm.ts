@@ -12,8 +12,8 @@ export class Exhausted extends Error {
 export class StreamInterrupted extends Error {}
 
 export interface LLM {
-  object<T>(role: Role, messages: Msg[], schema: { parse(data: unknown): T }, opts?: { signal?: AbortSignal }): Promise<Result<T>>;
-  stream(role: Role, messages: Msg[], opts?: { signal?: AbortSignal }): AsyncIterable<string>;
+  object<T>(role: Role, messages: Msg[], schema: { parse(data: unknown): T }, opts?: { signal?: AbortSignal; reserve?: number }): Promise<Result<T>>;
+  stream(role: Role, messages: Msg[], opts?: { signal?: AbortSignal; maxWaitMs?: number }): AsyncIterable<string>;
   maxInputTokens(role: Role): number;
 }
 
@@ -21,11 +21,13 @@ export interface LLMDeps {
   keys: Partial<Record<ProviderId, string>>;
   fetch?: typeof fetch;
   now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
   log?: (message: string) => void;
 }
 
-const FIRST_BYTE_MS: Record<Role, number> = { route: 8000, structure: 20000, write: 10000 };
+const FIRST_BYTE_MS: Record<Role, number> = { route: 8000, structure: 40000, write: 10000 };
 const IDLE_MS = 15000;
+const DAILY_RETRY_MS = 60 * 60 * 1000;
 const WINDOW_MS = 60000;
 
 interface ProviderState {
@@ -93,6 +95,7 @@ async function* sseDeltas(res: Response, onChunk: () => void): AsyncGenerator<st
 export function createLLM(deps: LLMDeps): LLM {
   const doFetch = deps.fetch ?? fetch;
   const now = deps.now ?? Date.now;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const log = deps.log ?? (() => {});
   const fail = (errors: string[], message: string) => {
     errors.push(message);
@@ -100,6 +103,7 @@ export function createLLM(deps: LLMDeps): LLM {
   };
   const keys = deps.keys;
   const states = new Map<string, ProviderState>();
+  const providerCooldown = new Map<ProviderId, number>();
 
   const state = (slot: Slot) => {
     const id = `${slot.provider}/${slot.model}`;
@@ -113,14 +117,17 @@ export function createLLM(deps: LLMDeps): LLM {
 
   const chain = (role: Role) => CHAINS[role].filter((slot) => keys[slot.provider]);
 
-  function blockedFor(slot: Slot, estimate: number): { ms: number; reason: string } | null {
+  function blockedFor(slot: Slot, estimate: number, reserve = 0): { ms: number; reason: string } | null {
     const provider = PROVIDERS[slot.provider];
     const s = state(slot);
     const t = now();
+    const daily = providerCooldown.get(slot.provider) ?? 0;
+    if (daily > t) return { ms: daily - t, reason: 'daily limit reached' };
     if (s.cooldownUntil > t) return { ms: s.cooldownUntil - t, reason: 'cooling down' };
     s.calls = s.calls.filter((at) => t - at < WINDOW_MS);
     s.tokens = s.tokens.filter(([at]) => t - at < WINDOW_MS);
-    if (provider.rpm && s.calls.length >= provider.rpm) return { ms: WINDOW_MS - (t - s.calls[0]), reason: 'request limit for this minute reached' };
+    const allowed = (provider.rpm ?? Infinity) - reserve;
+    if (s.calls.length >= allowed) return { ms: WINDOW_MS - (t - s.calls[s.calls.length - allowed]), reason: 'request limit for this minute reached' };
     const used = s.tokens.reduce((sum, [, n]) => sum + n, 0);
     if (provider.tpm && s.tokens.length && used + estimate > provider.tpm) return { ms: WINDOW_MS - (t - s.tokens[0][0]), reason: 'token limit for this minute reached' };
     return null;
@@ -137,9 +144,13 @@ export function createLLM(deps: LLMDeps): LLM {
   };
 
   async function failure(slot: Slot, res: Response): Promise<string> {
-    const body = (await res.text().catch(() => '')).replace(/\s+/g, ' ').slice(0, 160);
+    const full = await res.text().catch(() => '');
+    const body = full.replace(/\s+/g, ' ').slice(0, 160);
     const retryAfter = Number(res.headers.get('retry-after'));
-    if (res.status === 429) cool(slot, retryAfter > 0 ? retryAfter * 1000 : 30000);
+    if (res.status === 429 && /free-models-per-day/.test(full)) {
+      const reset = Number(full.match(/"X-RateLimit-Reset"\s*:\s*"?(\d{10,})/i)?.[1]);
+      providerCooldown.set(slot.provider, reset > now() ? reset : now() + DAILY_RETRY_MS);
+    } else if (res.status === 429) cool(slot, retryAfter > 0 ? retryAfter * 1000 : 30000);
     else if (res.status >= 500) cool(slot, 15000);
     else if ([401, 403, 404].includes(res.status)) cool(slot, 600000);
     return `${slot.provider} ${res.status} ${body}`.trim();
@@ -154,14 +165,54 @@ export function createLLM(deps: LLMDeps): LLM {
     });
   }
 
+  async function* streamOnce(role: Role, messages: Msg[], opts: { signal?: AbortSignal }): AsyncGenerator<string> {
+    const errors: string[] = [];
+    const estimate = estimateTokens(messages);
+    let soonest = Infinity;
+
+    for (const slot of chain(role)) {
+      const blocked = blockedFor(slot, estimate);
+      if (blocked) {
+        errors.push(`${slot.provider}: ${blocked.reason}`);
+        soonest = Math.min(soonest, blocked.ms);
+        continue;
+      }
+      spend(slot, estimate);
+      const t = timer(opts.signal, FIRST_BYTE_MS[role]);
+      let yielded = false;
+      try {
+        const res = await post(slot, messages, { stream: true }, t.signal);
+        if (!res.ok) {
+          fail(errors, await failure(slot, res));
+          continue;
+        }
+        for await (const delta of sseDeltas(res, () => t.touch(IDLE_MS))) {
+          yielded = true;
+          yield delta;
+        }
+        if (yielded) return;
+        fail(errors, `${slot.provider}: empty reply`);
+      } catch (e) {
+        if (opts.signal?.aborted) throw e;
+        cool(slot, 10000);
+        if (yielded) throw new StreamInterrupted(`${slot.provider}: ${describe(e)}`);
+        fail(errors, `${slot.provider}: ${describe(e)}`);
+      } finally {
+        t.stop();
+      }
+    }
+
+    throw new Exhausted(errors.join('; ') || 'no model provider available', Number.isFinite(soonest) ? soonest : 0);
+  }
+
   return {
-    async object<T>(role: Role, messages: Msg[], schema: { parse(data: unknown): T }, opts: { signal?: AbortSignal } = {}): Promise<Result<T>> {
+    async object<T>(role: Role, messages: Msg[], schema: { parse(data: unknown): T }, opts: { signal?: AbortSignal; reserve?: number } = {}): Promise<Result<T>> {
       const errors: string[] = [];
       const estimate = estimateTokens(messages);
 
       for (const slot of chain(role)) {
         if (opts.signal?.aborted) return { ok: false, error: 'aborted' };
-        const blocked = blockedFor(slot, estimate);
+        const blocked = blockedFor(slot, estimate, opts.reserve);
         if (blocked) {
           errors.push(`${slot.provider}: ${blocked.reason}`);
           continue;
@@ -204,44 +255,18 @@ export function createLLM(deps: LLMDeps): LLM {
       return { ok: false, error: errors.join('; ') || 'no model provider available' };
     },
 
-    async *stream(role: Role, messages: Msg[], opts: { signal?: AbortSignal } = {}): AsyncGenerator<string> {
-      const errors: string[] = [];
-      const estimate = estimateTokens(messages);
-      let soonest = Infinity;
-
-      for (const slot of chain(role)) {
-        const blocked = blockedFor(slot, estimate);
-        if (blocked) {
-          errors.push(`${slot.provider}: ${blocked.reason}`);
-          soonest = Math.min(soonest, blocked.ms);
-          continue;
-        }
-        spend(slot, estimate);
-        const t = timer(opts.signal, FIRST_BYTE_MS[role]);
-        let yielded = false;
+    async *stream(role: Role, messages: Msg[], opts: { signal?: AbortSignal; maxWaitMs?: number } = {}): AsyncGenerator<string> {
+      const giveUpAt = now() + (opts.maxWaitMs ?? 0);
+      while (true) {
         try {
-          const res = await post(slot, messages, { stream: true }, t.signal);
-          if (!res.ok) {
-            fail(errors, await failure(slot, res));
-            continue;
-          }
-          for await (const delta of sseDeltas(res, () => t.touch(IDLE_MS))) {
-            yielded = true;
-            yield delta;
-          }
-          if (yielded) return;
-          fail(errors, `${slot.provider}: empty reply`);
+          yield* streamOnce(role, messages, opts);
+          return;
         } catch (e) {
-          if (opts.signal?.aborted) throw e;
-          cool(slot, 10000);
-          if (yielded) throw new StreamInterrupted(`${slot.provider}: ${describe(e)}`);
-          fail(errors, `${slot.provider}: ${describe(e)}`);
-        } finally {
-          t.stop();
+          const wait = e instanceof Exhausted ? e.retryAfterMs : 0;
+          if (!wait || opts.signal?.aborted || now() + wait > giveUpAt) throw e;
+          await sleep(wait + 50);
         }
       }
-
-      throw new Exhausted(errors.join('; ') || 'no model provider available', Number.isFinite(soonest) ? soonest : 0);
     },
 
     maxInputTokens(role: Role): number {

@@ -16,10 +16,16 @@
   #log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 16px; }
   .msg { max-width: 720px; width: 100%; margin: 0 auto; }
   .you { background: var(--soft); border-radius: 12px; padding: 8px 12px; white-space: pre-wrap; }
-  .text { white-space: pre-wrap; word-wrap: break-word; }
+  .text { word-wrap: break-word; }
+  .text p { margin: 0 0 0.6em; }
+  .text ul, .text ol { margin: 0.2em 0 0.7em; padding-left: 1.3em; }
+  .text li { margin: 0.25em 0; }
   .recall { border-left: 3px solid var(--accent); padding: 2px 12px; margin-bottom: 8px; color: var(--muted); font-size: 14px; }
   .recall q { display: block; color: var(--fg); quotes: none; margin: 4px 0; }
   .meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .sources { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 6px; font-size: 13px; }
+  .sources a { color: var(--accent); text-decoration: none; }
+  .sources a:hover { text-decoration: underline; }
   form { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); max-width: 752px; width: 100%; margin: 0 auto; }
   textarea { flex: 1; font: inherit; color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; resize: none; max-height: 160px; }
 </style>
@@ -52,8 +58,46 @@
     return node;
   };
 
-  const format = (text) =>
-    text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  const inline = (line) =>
+    line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+
+  function format(text) {
+    const html = [];
+    let list = null;
+    let paragraph = [];
+    const closeParagraph = () => {
+      if (paragraph.length) html.push(`<p>${paragraph.join('<br>')}</p>`);
+      paragraph = [];
+    };
+    const closeList = () => {
+      if (list) html.push(`</${list}>`);
+      list = null;
+    };
+    for (const line of text.split('\n')) {
+      const bullet = line.match(/^\s*[-*•]\s+(.*)$/);
+      const numbered = line.match(/^\s*\d+[.)]\s+(.*)$/);
+      const item = bullet || numbered;
+      if (item) {
+        closeParagraph();
+        const kind = bullet ? 'ul' : 'ol';
+        if (list !== kind) {
+          closeList();
+          html.push(`<${kind}>`);
+          list = kind;
+        }
+        html.push(`<li>${inline(item[1])}</li>`);
+      } else if (!line.trim()) {
+        closeParagraph();
+        closeList();
+      } else {
+        closeList();
+        paragraph.push(inline(line.trim()));
+      }
+    }
+    closeParagraph();
+    closeList();
+    return html.join('');
+  }
 
   function addMessage() {
     const wrap = el('div', 'msg');
@@ -105,6 +149,19 @@
           answer += event.text;
           answerEl.innerHTML = format(answer);
           meta.textContent = '';
+        }
+        if (event.type === 'sources') {
+          const box = el('div', 'sources');
+          for (const s of event.items) {
+            if (!/^https?:/.test(s.url)) continue;
+            const link = el('a', '', `[${s.n}] ${new URL(s.url).hostname.replace(/^www\./, '')}`);
+            link.href = s.url;
+            link.target = '_blank';
+            link.rel = 'noopener noreferrer';
+            link.title = s.title;
+            box.append(link);
+          }
+          bot.insertBefore(box, meta);
         }
         if (event.type === 'done') {
           const secs = (event.timings.total / 1000).toFixed(1);

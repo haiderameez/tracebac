@@ -1,39 +1,17 @@
-import { Exhausted, StreamInterrupted, type LLM } from './llm.ts';
-import type { Memory } from './memory.ts';
+import { extract, ledgerEvidence } from './claims.ts';
+import { BUDGET } from './config.ts';
+import { Exhausted, StreamInterrupted } from './llm.ts';
 import { recallMessages } from './prompts.ts';
 import { dayLabel, referentLabel, renderAmbiguous, renderNotFound, renderRecall } from './render.ts';
-import { localDay, resolveTimeRef, type Clock } from './time.ts';
-import type { DateCandidates, Intent, Referent, Route, Turn, TurnEvent } from './types.ts';
+import { research } from './research.ts';
+import { localDay, resolveTimeRef } from './time.ts';
+import { lap, say, type Ctx, type Deps, type TurnRequest } from './turn.ts';
+import type { DateCandidates, Intent, Referent, Turn, TurnEvent } from './types.ts';
 import { understand } from './understand.ts';
 
-export interface Deps {
-  clock: Clock;
-  memory: Memory;
-  llm: LLM;
-}
+export type { Deps, TurnRequest } from './turn.ts';
 
-export interface TurnRequest {
-  sessionId: string;
-  userId: string;
-  text: string;
-  tz: string;
-  signal?: AbortSignal;
-}
-
-interface Ctx {
-  answer: string;
-  route: Route | null;
-  timings: Record<string, number>;
-}
-
-function* say(ctx: Ctx, text: string): Generator<TurnEvent> {
-  ctx.answer += text;
-  yield { type: 'delta', text };
-}
-
-const lap = (ctx: Ctx, name: string, from: number) => {
-  ctx.timings[name] = Math.round(performance.now() - from);
-};
+const EXTRACTION_WAIT_MS = 3000;
 
 export async function* runTurn(deps: Deps, req: TurnRequest): AsyncGenerator<TurnEvent> {
   const { memory, llm, clock } = deps;
@@ -46,28 +24,24 @@ export async function* runTurn(deps: Deps, req: TurnRequest): AsyncGenerator<Tur
 
   try {
     const today = localDay(now, turn.tz);
+    const recent = memory.recentTurns(req.sessionId, 6);
     const t0 = performance.now();
     const { intent } = await understand(
       llm,
-      {
-        message: req.text,
-        recent: memory.recentTurns(req.sessionId, 6),
-        threadIndex: memory.threadIndex(req.userId, 40),
-        today,
-        tz: turn.tz,
-      },
+      { message: req.text, recent, threadIndex: memory.threadIndex(req.userId, 40), today, tz: turn.tz },
       req.signal,
     );
     lap(ctx, 'understand', t0);
     topic = intent.topic;
     ctx.route = intent.route;
+    const todayLabel = dayLabel(today.date);
 
     if (intent.route === 'chat' || intent.route === 'clarify') {
       yield* say(ctx, intent.reply ?? '');
     } else if (intent.route === 'research') {
-      yield* say(ctx, "Web search isn't connected yet, so I can't look that up.");
+      yield* research({ deps, req, ctx, intent, recent, todayLabel, tz: turn.tz });
     } else {
-      yield* fromMemory({ deps, req, ctx, intent, now, tz: turn.tz, todayLabel: dayLabel(today.date) });
+      yield* fromMemory({ deps, req, ctx, intent, now, tz: turn.tz, todayLabel });
     }
   } catch (e) {
     if (req.signal?.aborted) {
@@ -79,14 +53,41 @@ export async function* runTurn(deps: Deps, req: TurnRequest): AsyncGenerator<Tur
   }
 
   lap(ctx, 'total', started);
+  const research_ = status === 'done' ? ctx.research : undefined;
   memory.finishTurn(turn.id, {
     answerText: ctx.answer,
     route: ctx.route,
     topic: topic || req.text.slice(0, 60),
     answeredAt: clock.now(),
     status,
+    extraction: research_ ? 'pending' : 'none',
   });
+  if (research_) scheduleExtraction(deps, turn.id, req, ctx.answer, research_.evidence);
   yield { type: 'done', turnId: turn.id, route: ctx.route, timings: ctx.timings };
+}
+
+function scheduleExtraction(deps: Deps, turnId: number, req: TurnRequest, answer: string, evidence: NonNullable<Ctx['research']>['evidence']) {
+  try {
+    deps.memory.saveEvidence(turnId, ledgerEvidence(evidence));
+  } catch {
+    deps.memory.setExtraction(turnId, 'failed');
+    return;
+  }
+
+  deps.background.run(req.userId, async () => {
+    const reasons: string[] = [];
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt) await new Promise((resolve) => setTimeout(resolve, BUDGET.extractRetryMs));
+      try {
+        deps.memory.commitExtraction(turnId, await extract(deps.llm, { question: req.text, answer, evidence }));
+        return;
+      } catch (e) {
+        reasons.push(e instanceof Error ? e.message : String(e));
+      }
+    }
+    deps.log?.(`could not save claims for turn ${turnId}: ${reasons.join(' | ')}`);
+    deps.memory.setExtraction(turnId, 'failed');
+  });
 }
 
 async function* fromMemory(a: {
@@ -110,6 +111,7 @@ async function* fromMemory(a: {
     return;
   }
 
+  await deps.background.settle(req.userId, EXTRACTION_WAIT_MS);
   const ref: Referent = deps.memory.findReferent(req.userId, { dates, topicHint: intent.topicHint, entityRefs: intent.entityRefs });
 
   if (ref.match === 'none') {
@@ -133,7 +135,7 @@ async function* fromMemory(a: {
   const t0 = performance.now();
   let wrote = false;
   try {
-    for await (const delta of deps.llm.stream('write', recallMessages(req.text, ref, a.todayLabel), { signal: req.signal })) {
+    for await (const delta of deps.llm.stream('write', recallMessages(req.text, ref, a.todayLabel), { signal: req.signal, maxWaitMs: BUDGET.writeWaitMs })) {
       wrote = true;
       yield* say(ctx, delta);
     }

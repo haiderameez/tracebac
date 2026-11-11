@@ -1,5 +1,6 @@
+import { domainOf } from './search.ts';
 import { dowOf } from './time.ts';
-import type { DateRange, Referent } from './types.ts';
+import type { DateRange, EvidenceItem, Referent } from './types.ts';
 
 const DAYS = ['', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -45,7 +46,7 @@ export function renderRecall(ref: Referent): string {
     const asked = `On ${dayLabel(t.localDate)} you asked:\n> ${t.userText}`;
     return t.answerText ? `${asked}\n\nI answered: ${clip(t.answerText, 700)}` : asked;
   });
-  return `${parts.join('\n\n')}\n\nThe model providers are rate-limited right now, so this is the stored record, not a summary.`;
+  return `${parts.join('\n\n')}\n\nThe free model providers are all over their limits right now, so this is the stored record, not a summary.`;
 }
 
 export function memoryRows(ref: Referent): string {
@@ -76,4 +77,9 @@ export function memoryRows(ref: Referent): string {
   }
 
   return lines.join('\n');
+}
+
+export function renderSources(evidence: EvidenceItem[]): string {
+  const lines = evidence.slice(0, 5).map((e) => `- ${clip(e.title, 70)} (${domainOf(e.url)}): ${clip(e.text.replace(/\s+/g, ' '), 160)} [${e.n}]`);
+  return `The free model providers are all over their limits right now, so I couldn't write this up. Here is what I found:\n${lines.join('\n')}`;
 }

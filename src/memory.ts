@@ -87,6 +87,39 @@ export class Memory {
     return Number(this.run(`UPDATE turns SET status='failed' WHERE status='pending'`).changes);
   }
 
+  saveEvidence(turnId: number, items: Extraction['evidence']) {
+    this.tx(() => {
+      for (const item of items) this.insertEvidence(turnId, item);
+    });
+  }
+
+  evidenceFor(turnId: number): Evidence[] {
+    return this.all('SELECT * FROM evidence WHERE turn_id=? ORDER BY id', turnId).map(mapEvidence);
+  }
+
+  private insertEvidence(turnId: number, e: Extraction['evidence'][number]): number {
+    const hash = sha(norm(e.chunk));
+    const existing = this.one('SELECT id FROM evidence WHERE turn_id=? AND url=? AND chunk_hash=?', turnId, e.url, hash);
+    if (existing) return existing.id;
+    return Number(this.run(
+      'INSERT INTO evidence(turn_id, url, title, chunk, chunk_hash, fetched_at, published_at, via) VALUES (?,?,?,?,?,?,?,?)',
+      turnId, e.url, e.title ?? null, e.chunk, hash, e.fetchedAt, e.publishedAt ?? null, e.via,
+    ).lastInsertRowid);
+  }
+
+  getCache(key: string): { body: string; fetchedAt: number } | undefined {
+    const r = this.one('SELECT body, fetched_at FROM cache WHERE key=?', key);
+    return r && { body: r.body, fetchedAt: r.fetched_at };
+  }
+
+  putCache(key: string, kind: 'search' | 'page', body: string, ttlS: number, now: number) {
+    this.run('INSERT OR REPLACE INTO cache(key, kind, body, fetched_at, ttl_s) VALUES (?,?,?,?,?)', key, kind, body, now, ttlS);
+  }
+
+  pruneCache(olderThan: number): number {
+    return Number(this.run('DELETE FROM cache WHERE fetched_at < ?', olderThan).changes);
+  }
+
   getTurn(id: number): Turn | undefined {
     const r = this.one('SELECT * FROM turns WHERE id=?', id);
     return r && mapTurn(r);
@@ -147,13 +180,7 @@ export class Memory {
         this.run('INSERT OR IGNORE INTO turn_entities(turn_id, entity_id) VALUES (?,?)', turnId, entityId);
 
       const ev = new Map<string, { id: number; chunk: string }>();
-      for (const e of x.evidence) {
-        const id = Number(this.run(
-          'INSERT INTO evidence(turn_id, url, title, chunk, chunk_hash, fetched_at, published_at, via) VALUES (?,?,?,?,?,?,?,?)',
-          turnId, e.url, e.title ?? null, e.chunk, sha(norm(e.chunk)), e.fetchedAt, e.publishedAt ?? null, e.via,
-        ).lastInsertRowid);
-        ev.set(e.key, { id, chunk: norm(e.chunk) });
-      }
+      for (const e of x.evidence) ev.set(e.key, { id: this.insertEvidence(turnId, e), chunk: norm(e.chunk) });
 
       for (const e of x.entities) link(this.upsertEntity(turn.userId, e));
 

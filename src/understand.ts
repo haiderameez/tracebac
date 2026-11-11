@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { BUDGET } from './config.ts';
 import type { LLM } from './llm.ts';
 import { routerMessages } from './prompts.ts';
 import type { Aspect, Intent, TimeRef, Turn } from './types.ts';
@@ -58,10 +59,37 @@ export function isTrivial(message: string): boolean {
   return words.length > 0 && words.length <= 5 && words.every((w) => SMALL_TALK.has(w));
 }
 
-function smallTalkReply(message: string): string {
-  if (/\b(thanks|thank|thx|ty)\b/i.test(message)) return 'Anytime.';
-  if (/\b(bye|goodbye|night)\b/i.test(message)) return 'Bye.';
-  return 'Hey, what are we looking into?';
+export const SMALL_TALK_REPLIES = {
+  greeting: [
+    'Hey, what are we looking into?',
+    'Hi! What can I dig up for you?',
+    'Hey there. What do you want to know?',
+    "Hello. What's on your mind?",
+    "Hey. Ask me anything, I'll look it up.",
+    'Hi, what are we researching today?',
+  ],
+  thanks: ['Anytime.', "You're welcome.", 'Happy to help.', 'No problem.', 'Glad that helped.', 'Sure thing.'],
+  ack: ['Got it.', 'Sounds good.', 'Alright.', 'Cool, anything else?', "Okay. Let me know what's next.", 'Great. Ask away whenever.'],
+  bye: ['Bye.', 'See you later.', 'Take care.', 'Catch you later.', 'Talk soon.'],
+} as const;
+
+type SmallTalk = keyof typeof SMALL_TALK_REPLIES;
+const lastPicked = new Map<SmallTalk, number>();
+
+function smallTalkKind(message: string): SmallTalk {
+  if (/\b(bye|goodbye|night)\b/i.test(message)) return 'bye';
+  if (/\b(thanks|thank|thx|ty)\b/i.test(message)) return 'thanks';
+  if (/\b(ok|okay|cool|great|nice|perfect|awesome|lol|np|got)\b/i.test(message)) return 'ack';
+  return 'greeting';
+}
+
+export function smallTalkReply(message: string, random: () => number = Math.random): string {
+  const kind = smallTalkKind(message);
+  const options = SMALL_TALK_REPLIES[kind];
+  const choices = options.map((_, i) => i).filter((i) => i !== lastPicked.get(kind));
+  const index = choices[Math.floor(random() * choices.length)];
+  lastPicked.set(kind, index);
+  return options[index];
 }
 
 const GENERIC_HINT = new Set([
@@ -72,7 +100,7 @@ const GENERIC_HINT = new Set([
 const isGenericHint = (hint: string) => (hint.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).every((w) => GENERIC_HINT.has(w));
 
 export function applyGuards(intent: Intent, message: string): Intent {
-  const out: Intent = { ...intent, queries: intent.queries.slice(0, 4) };
+  const out: Intent = { ...intent, queries: intent.queries.slice(0, BUDGET.searches) };
   if (out.topicHint && isGenericHint(out.topicHint)) out.topicHint = undefined;
 
   if ((out.refersToPast || out.timeRefs.length) && (out.route === 'research' || out.route === 'chat')) out.route = 'recall';
