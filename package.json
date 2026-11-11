@@ -1,0 +1,15 @@
+{
+  "name": "tracebac",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A chat agent whose memory is a ledger of dated, sourced, re-checkable claims.",
+  "engines": { "node": ">=22.18" },
+  "scripts": {
+    "typecheck": "tsc -p ."
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
+  }
+}
