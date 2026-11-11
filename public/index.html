@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tracebac</title>
+<style>
+  :root { color-scheme: light dark; --bg: #fff; --fg: #1b1b1b; --muted: #6b6b6b; --line: #e2e2e2; --soft: #f3f3f3; --accent: #2457d6; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #141414; --fg: #e8e8e8; --muted: #9a9a9a; --line: #2a2a2a; --soft: #1f1f1f; --accent: #7ea2ff; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, sans-serif; display: flex; flex-direction: column; height: 100dvh; }
+  header { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+  header strong { letter-spacing: 0.02em; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--bg); color: var(--fg); border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  #log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 16px; }
+  .msg { max-width: 720px; width: 100%; margin: 0 auto; }
+  .you { background: var(--soft); border-radius: 12px; padding: 8px 12px; white-space: pre-wrap; }
+  .text { white-space: pre-wrap; word-wrap: break-word; }
+  .recall { border-left: 3px solid var(--accent); padding: 2px 12px; margin-bottom: 8px; color: var(--muted); font-size: 14px; }
+  .recall q { display: block; color: var(--fg); quotes: none; margin: 4px 0; }
+  .meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  form { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); max-width: 752px; width: 100%; margin: 0 auto; }
+  textarea { flex: 1; font: inherit; color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; resize: none; max-height: 160px; }
+</style>
+</head>
+<body>
+<header><strong>tracebac</strong><button id="new" type="button">new chat</button></header>
+<main id="log"></main>
+<form id="form">
+  <textarea id="input" rows="1" placeholder="ask anything" autofocus></textarea>
+  <button id="send">send</button>
+</form>
+<script>
+  const store = {
+    get(key) { try { return localStorage.getItem(key); } catch { return null; } },
+    set(key, value) { try { localStorage.setItem(key, value); } catch {} },
+  };
+  const userId = store.get('tracebac.user') || crypto.randomUUID();
+  store.set('tracebac.user', userId);
+  let sessionId = store.get('tracebac.session') || crypto.randomUUID();
+  store.set('tracebac.session', sessionId);
+
+  const log = document.getElementById('log');
+  const input = document.getElementById('input');
+  const send = document.getElementById('send');
+
+  const el = (tag, cls, text) => {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  };
+
+  const format = (text) =>
+    text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+
+  function addMessage() {
+    const wrap = el('div', 'msg');
+    log.append(wrap);
+    log.scrollTop = log.scrollHeight;
+    return wrap;
+  }
+
+  async function ask(text) {
+    const you = addMessage();
+    you.append(el('div', 'you', text));
+    const bot = addMessage();
+    const answerEl = el('div', 'text');
+    const meta = el('div', 'meta', 'thinking...');
+    bot.append(answerEl, meta);
+    let answer = '';
+
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId, userId, text, tz: Intl.DateTimeFormat().resolvedOptions().timeZone }),
+    });
+    if (!res.ok || !res.body) {
+      meta.textContent = '';
+      answerEl.textContent = `request failed (${res.status})`;
+      return;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let split;
+      while ((split = buffer.indexOf('\n\n')) >= 0) {
+        const line = buffer.slice(0, split).trim();
+        buffer = buffer.slice(split + 2);
+        if (!line.startsWith('data:')) continue;
+        const event = JSON.parse(line.slice(5));
+        if (event.type === 'status') meta.textContent = event.text;
+        if (event.type === 'recall') {
+          const box = el('div', 'recall', `from ${event.label}`);
+          for (const quote of event.quotes) box.append(el('q', '', `"${quote}"`));
+          bot.insertBefore(box, answerEl);
+        }
+        if (event.type === 'delta') {
+          answer += event.text;
+          answerEl.innerHTML = format(answer);
+          meta.textContent = '';
+        }
+        if (event.type === 'done') {
+          const secs = (event.timings.total / 1000).toFixed(1);
+          meta.textContent = `${event.route ?? 'error'} · ${secs}s`;
+        }
+        log.scrollTop = log.scrollHeight;
+      }
+    }
+  }
+
+  document.getElementById('form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    input.style.height = '';
+    send.disabled = true;
+    try {
+      await ask(text);
+    } catch (err) {
+      log.append(el('div', 'meta', `connection error: ${err.message}`));
+    }
+    send.disabled = false;
+    input.focus();
+  });
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      document.getElementById('form').requestSubmit();
+    }
+  });
+  input.addEventListener('input', () => {
+    input.style.height = 'auto';
+    input.style.height = `${input.scrollHeight}px`;
+  });
+
+  document.getElementById('new').addEventListener('click', () => {
+    sessionId = crypto.randomUUID();
+    store.set('tracebac.session', sessionId);
+    log.replaceChildren();
+    input.focus();
+  });
+</script>
+</body>
+</html>

@@ -65,7 +65,7 @@ export class Memory {
   }
 
   finishTurn(id: number, r: {
-    answerText: string; route: Route; topic: string; answeredAt: number; status: Turn['status']; extraction?: Turn['extraction'];
+    answerText: string; route: Route | null; topic: string; answeredAt: number; status: Turn['status']; extraction?: Turn['extraction'];
   }) {
     this.tx(() => {
       this.run(

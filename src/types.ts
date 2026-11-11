@@ -103,3 +103,32 @@ export interface ExtractionResult {
   unverifiable: number;
   droppedMembers: string[];
 }
+
+export type Role = 'route' | 'structure' | 'write';
+
+export interface Msg {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
+export type Result<T> =
+  | { ok: true; value: T; provider: string; model: string; ms: number }
+  | { ok: false; error: string };
+
+export interface Intent {
+  route: 'chat' | 'recall' | 'recheck' | 'research' | 'clarify';
+  reply?: string;
+  topic: string;
+  refersToPast: boolean;
+  timeRefs: TimeRef[];
+  topicHint?: string;
+  entityRefs: string[];
+  aspects: Aspect[];
+  queries: string[];
+}
+
+export type TurnEvent =
+  | { type: 'status'; text: string }
+  | { type: 'recall'; label: string; quotes: string[]; entities: string[] }
+  | { type: 'delta'; text: string }
+  | { type: 'done'; turnId: number; route: Route | null; timings: Record<string, number> };
