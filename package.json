@@ -10,6 +10,7 @@
   "scripts": {
     "predev": "node check-node.mjs",
     "dev": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env src/index.ts",
+    "start": "node --disable-warning=ExperimentalWarning src/index.ts",
     "typecheck": "tsc -p .",
     "replay": "node scripts/replay.mjs"
   },
