@@ -51,18 +51,28 @@ A fresh install has no history, so "what did I ask on Monday?" has nothing to fi
 ## How it works
 
 ```mermaid
-flowchart TD
-  Q["your message"] --> R["route: one small model call plus code guards"]
-  R -->|"small talk or a writing request"| C["chat: the model writes the reply"]
-  R -->|"needs facts from the web, or a follow-up"| S["research: parallel searches, read pages, cited answer"]
-  R -->|"asks about an earlier chat"| M["find the turn: date and topic resolved in code"]
-  C -->|"needs a fact, so it says SEARCH"| S
-  M -->|"what did I ask"| RC["recall: quote it back"]
-  M -->|"is it still true, what changed"| RK["recheck: re-read old sources, compare quotes, count changes"]
-  S --> L[("ledger: SQLite")]
+%%{init: {"flowchart": {"curve": "basis", "nodeSpacing": 40, "rankSpacing": 60}}}%%
+flowchart LR
+  U(["your message"]) --> R{{"route<br/>one small model call<br/>plus code guards"}}
+  R -->|"small talk,<br/>writing"| C["chat<br/>the model writes<br/>the reply"]
+  R -->|"web facts,<br/>follow-ups"| S["research<br/>search, read pages,<br/>cited answer"]
+  R -->|"about an<br/>earlier chat"| M["find the turn<br/>dates and topic<br/>resolved in code"]
+  C -.->|"needs a fact"| S
+  M -->|"what did I ask"| RC["recall<br/>quote it back"]
+  M -->|"is it still true"| RK["recheck<br/>re-read sources,<br/>compare quotes"]
+  S --> L[("ledger<br/>SQLite")]
   RC --> L
   RK --> L
-  L -.->|"dated claims with source quotes"| M
+  L -.->|"claims and quotes"| M
+
+  classDef input fill:#868e96,stroke:#495057,color:#fff
+  classDef router fill:#5c7cfa,stroke:#364fc7,color:#fff
+  classDef path fill:#0ca678,stroke:#087f5b,color:#fff
+  classDef store fill:#f08c00,stroke:#d9480f,color:#fff
+  class U input
+  class R router
+  class C,S,M,RC,RK path
+  class L store
 ```
 
 - **Route.** One small model call picks the route and rewrites a follow-up as a full question ("games before that?" becomes a question about the right team). Code guards fix the costly mistakes: a message about the past never becomes a web search, and a factual question is never answered from the model's memory.
