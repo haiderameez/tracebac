@@ -42,6 +42,7 @@ export interface TurnRequest {
 }
 
 export interface Ctx {
+  turnId: number;
   answer: string;
   route: Route | null;
   timings: Record<string, number>;

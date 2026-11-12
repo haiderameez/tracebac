@@ -5,6 +5,7 @@ import type { Volatility } from './types.ts';
 export interface SearchQuery {
   q: string;
   since?: string;
+  news?: boolean;
   volatility: Volatility;
 }
 
@@ -21,6 +22,7 @@ export interface Page {
   title: string;
   text: string;
   fetchedAt: number;
+  publishedAt?: number;
 }
 
 export type Outcome<T> = { ok: true; value: T; cached: boolean; provider: string } | { ok: false; error: string };
@@ -93,11 +95,18 @@ export function cleanMarkdown(md: string): string {
     .trim();
 }
 
-function parseJina(raw: string): { title: string; text: string } {
+interface Read {
+  title: string;
+  text: string;
+  publishedAt?: number;
+}
+
+function parseJina(raw: string): Read {
   const title = raw.match(/^Title:\s*(.*)$/m)?.[1]?.trim() ?? '';
+  const published = Date.parse(raw.match(/^Published Time:\s*(.*)$/m)?.[1]?.trim() ?? '');
   const marker = raw.indexOf('Markdown Content:');
   const body = marker >= 0 ? raw.slice(marker + 'Markdown Content:'.length) : raw;
-  return { title, text: cleanMarkdown(body).slice(0, MAX_PAGE_CHARS) };
+  return { title, text: cleanMarkdown(body).slice(0, MAX_PAGE_CHARS), publishedAt: Number.isFinite(published) ? published : undefined };
 }
 
 export async function pooled<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
@@ -117,6 +126,11 @@ const parseDate = (value: unknown): number | undefined => {
   const t = typeof value === 'string' ? Date.parse(value) : NaN;
   return Number.isFinite(t) ? t : undefined;
 };
+
+export function recencyFilter(since: string, nowMs: number): string {
+  const days = (nowMs - Date.parse(since)) / 86_400_000;
+  return days <= 1.5 ? 'qdr:d' : days <= 8 ? 'qdr:w' : days <= 32 ? 'qdr:m' : 'qdr:y';
+}
 
 function cooldownFor(e: unknown): number {
   if (!(e instanceof HttpError)) return 10000;
@@ -153,7 +167,7 @@ export function createWebSearch(deps: WebSearchDeps): WebSearch {
       const data = await postJson(
         'https://api.tavily.com/search',
         { authorization: `Bearer ${key}` },
-        { query: q.q, search_depth: 'basic', max_results: 6, topic: 'general', ...(q.since ? { start_date: q.since } : {}) },
+        { query: q.q, search_depth: 'basic', max_results: 6, topic: q.news ? 'news' : 'general', ...(q.since ? { start_date: q.since } : {}) },
         signal,
       );
       return (data.results ?? []).map((r: any) => ({
@@ -172,7 +186,7 @@ export function createWebSearch(deps: WebSearchDeps): WebSearch {
       }));
     },
     async serper(q, key, signal) {
-      const data = await postJson('https://google.serper.dev/search', { 'x-api-key': key }, { q: q.q, num: 6 }, signal);
+      const data = await postJson('https://google.serper.dev/search', { 'x-api-key': key }, { q: q.q, num: 6, ...(q.since ? { tbs: recencyFilter(q.since, now()) } : {}) }, signal);
       return (data.organic ?? []).map((r: any, i: number) => ({
         title: r.title || r.link, url: r.link, snippet: r.snippet ?? '', score: 1 - i / 10, publishedAt: parseDate(r.date),
       }));
@@ -180,7 +194,7 @@ export function createWebSearch(deps: WebSearchDeps): WebSearch {
   };
 
   async function searchOne(q: SearchQuery, signal: AbortSignal): Promise<Outcome<SearchHit[]>> {
-    const key = sha(`search|${q.q.toLowerCase().replace(/\s+/g, ' ').trim()}|${q.since ?? ''}`);
+    const key = sha(`search|${q.q.toLowerCase().replace(/\s+/g, ' ').trim()}|${q.since ?? ''}|${q.news ? 'news' : ''}`);
     const cached = deps.cache.get(key);
     if (cached && now() - cached.fetchedAt < FRESH_MS[q.volatility]) {
       return { ok: true, value: JSON.parse(cached.body), cached: true, provider: 'cache' };
@@ -236,7 +250,7 @@ export function createWebSearch(deps: WebSearchDeps): WebSearch {
     }
 
     const errors: string[] = [];
-    const attempts: [string, () => Promise<{ title: string; text: string }>][] = [];
+    const attempts: [string, () => Promise<Read>][] = [];
     if (available('jina')) attempts.push(['jina', () => jinaRead(url, opts.fresh, AbortSignal.any([opts.signal, AbortSignal.timeout(BUDGET.perReadMs)]))]);
     else errors.push('jina: cooling down');
     if (deps.keys.tavily && available('tavily-extract')) {
@@ -252,8 +266,8 @@ export function createWebSearch(deps: WebSearchDeps): WebSearch {
           continue;
         }
         const fetchedAt = now();
-        const value = { url, title: page.title, text: page.text, fetchedAt };
-        deps.cache.put(key, 'page', JSON.stringify({ url, title: page.title, text: page.text }), maxAge / 1000, fetchedAt);
+        const value = { url, title: page.title, text: page.text, fetchedAt, publishedAt: page.publishedAt };
+        deps.cache.put(key, 'page', JSON.stringify({ url, title: page.title, text: page.text, publishedAt: page.publishedAt }), maxAge / 1000, fetchedAt);
         return { ok: true, value, cached: false, provider: id };
       } catch (e) {
         if (opts.signal.aborted) return { ok: false, error: 'aborted' };

@@ -4,12 +4,13 @@ import { Exhausted, StreamInterrupted } from './llm.ts';
 import { synthMessages } from './prompts.ts';
 import { renderSources } from './render.ts';
 import { createSanitizer } from './sanitize.ts';
+import { addDays, localDay } from './time.ts';
 import { canonicalUrl, domainOf, type Outcome, type Page, type SearchHit, type SearchQuery } from './search.ts';
 import { lap, say, type Ctx, type Deps, type TurnRequest } from './turn.ts';
 import type { Aspect, EvidenceItem, Intent, Turn, TurnEvent, Volatility } from './types.ts';
 
-export function volatilityOf(aspects: Aspect[]): Volatility {
-  if (!aspects.length || aspects.includes('pricing') || aspects.includes('release')) return 'fast';
+export function volatilityOf(aspects: Aspect[], current = false): Volatility {
+  if (current || !aspects.length || aspects.includes('pricing') || aspects.includes('release')) return 'fast';
   return 'slow';
 }
 
@@ -38,7 +39,16 @@ export function pickPages(perQuery: SearchHit[][], limit: number, perDomain = 2)
   return picked;
 }
 
-const simplify = (q: string) => q.replace(/["“”]/g, '').replace(/\s+/g, ' ').trim();
+export function planQueries(intent: Pick<Intent, 'queries' | 'current' | 'aspects'>, today: string): SearchQuery[] {
+  const volatility = volatilityOf(intent.aspects, intent.current);
+  const base = intent.queries.slice(0, BUDGET.searches).map((q) => ({ q, volatility }));
+  if (!intent.current) return base;
+  const since = addDays(today, -BUDGET.freshDays);
+  const recent = base.slice(0, Math.min(BUDGET.freshVariants, BUDGET.searches - base.length)).map((q) => ({ ...q, since, news: true }));
+  return [...base, ...recent];
+}
+
+const simplify =(q: string) => q.replace(/["“”]/g, '').replace(/\s+/g, ' ').trim();
 
 export function readEarly(
   urls: string[],
@@ -89,11 +99,12 @@ export async function* research(a: {
   tz: string;
 }): AsyncGenerator<TurnEvent> {
   const { deps, req, ctx, intent } = a;
-  const volatility = volatilityOf(intent.aspects);
-  const queries: SearchQuery[] = intent.queries.slice(0, BUDGET.searches).map((q) => ({ q, volatility }));
+  const volatility = volatilityOf(intent.aspects, intent.current);
+  const queries = planQueries(intent, localDay(deps.clock.now(), a.tz).date);
+  const asked = Math.min(intent.queries.length, BUDGET.searches);
   const gather = req.signal ? AbortSignal.any([req.signal, AbortSignal.timeout(BUDGET.softDeadlineMs)]) : AbortSignal.timeout(BUDGET.softDeadlineMs);
 
-  yield { type: 'status', text: queries.length === 1 ? `searching: ${queries[0].q}` : `searching ${queries.length} queries` };
+  yield { type: 'status', text: asked === 1 ? `searching: ${intent.queries[0]}` : `searching ${asked} queries` };
   let t0 = performance.now();
   const results = await deps.web.search(queries, { signal: gather });
 
@@ -101,7 +112,7 @@ export async function* research(a: {
   const room = Math.max(0, BUDGET.searches - queries.length);
   if (retry.length && room) {
     const again = retry.slice(0, room);
-    const redone = await deps.web.search(again.map((i) => ({ q: simplify(queries[i].q), volatility })), { signal: gather });
+    const redone = await deps.web.search(again.map((i) => ({ ...queries[i], q: simplify(queries[i].q) })), { signal: gather });
     again.forEach((i, k) => (results[i] = redone[k]));
   }
   lap(ctx, 'search', t0);
@@ -132,13 +143,14 @@ export async function* research(a: {
   lap(ctx, 'read', t0);
 
   const pages = reads.flatMap((r, i) => (r.ok ? [{ url: chosen[i].url, title: r.value.title || chosen[i].title, text: r.value.text, fetchedAt: r.value.fetchedAt }] : []));
+  const published = new Map(reads.flatMap((r, i) => { const at = (r.ok && r.value.publishedAt) || chosen[i].publishedAt; return at ? [[chosen[i].url, at] as const] : []; }));
   const maxChars = Math.floor(Math.min(BUDGET.evidenceTokens, deps.llm.maxInputTokens('write') * 0.55) * 3.5);
   const chunks = selectChunks(pages, terms(...queries.map((q) => q.q), ...intent.entityRefs), intent.aspects.includes('pricing') ? 'pricing' : undefined, {
     perPage: Math.max(4, Math.ceil(BUDGET.maxChunks / Math.max(1, pages.length))), total: BUDGET.maxChunks, maxChars,
   });
 
   const fetchedAt = new Map(pages.map((p) => [p.url, p.fetchedAt]));
-  const evidence: EvidenceItem[] = chunks.map((c, i) => ({ n: i + 1, url: c.url, title: c.title, text: c.text, via: 'page', fetchedAt: fetchedAt.get(c.url) ?? deps.clock.now() }));
+  const evidence: EvidenceItem[] = chunks.map((c, i) => ({ n: i + 1, url: c.url, title: c.title, text: c.text, via: 'page', fetchedAt: fetchedAt.get(c.url) ?? deps.clock.now(), publishedAt: published.get(c.url) }));
 
   let used = evidence.reduce((n, e) => n + e.text.length, 0);
   const covered = new Set(evidence.map((e) => canonicalUrl(e.url)));
@@ -155,14 +167,15 @@ export async function* research(a: {
     return;
   }
 
-  ctx.research = { question: req.text, evidence };
+  const question = intent.standalone ?? req.text;
+  ctx.research = { question, evidence };
   yield { type: 'status', text: 'writing' };
   t0 = performance.now();
 
   const sanitizer = createSanitizer(evidence.map((e) => e.url), evidence.length);
   let wrote = false;
   try {
-    const messages = synthMessages({ question: req.text, recent: a.recent, evidence, gaps: failed, today: a.todayLabel, tz: a.tz });
+    const messages = synthMessages({ question, asked: req.text, recent: a.recent, evidence, gaps: failed, today: a.todayLabel, tz: a.tz });
     for await (const delta of deps.llm.stream('write', messages, { signal: req.signal, maxWaitMs: BUDGET.writeWaitMs })) {
       const text = sanitizer.push(delta);
       if (text) {
@@ -186,5 +199,5 @@ export async function* research(a: {
 
   const cited = new Set(sanitizer.cited());
   const shown = evidence.filter((e) => !cited.size || cited.has(e.n)).slice(0, 8);
-  yield { type: 'sources', items: shown.map((e) => ({ n: e.n, url: e.url, title: e.title, checkedAt: e.fetchedAt })) };
+  yield { type: 'sources', items: shown.map((e) => ({ n: e.n, url: e.url, title: e.title, checkedAt: e.fetchedAt, publishedAt: e.publishedAt })) };
 }

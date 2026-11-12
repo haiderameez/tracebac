@@ -9,6 +9,8 @@ export function createSanitizer(allowedUrls: Iterable<string>, maxCitation: numb
 
   const clean = (text: string) =>
     text
+      .replace(/【(\d{1,2})†[^】]*】/g, '[$1]')
+      .replace(/【(\d{1,2}(?:\s*[,，]\s*\d{1,2})*)】/g, (_match, list: string) => `[${list.replace(/，/g, ',')}]`)
       .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (match, label, url) => (isAllowed(url) ? match : label))
       .replace(/\[(\d{1,2}(?:\s*,\s*\d{1,2})*)\]/g, (_match, list: string) => {
         const valid = list.split(',').map((n) => Number(n.trim())).filter((n) => n >= 1 && n <= maxCitation);

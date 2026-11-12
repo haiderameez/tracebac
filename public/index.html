@@ -42,8 +42,9 @@
     get(key) { try { return localStorage.getItem(key); } catch { return null; } },
     set(key, value) { try { localStorage.setItem(key, value); } catch {} },
   };
-  const userId = store.get('tracebac.user') || crypto.randomUUID();
-  store.set('tracebac.user', userId);
+  const asUser = new URLSearchParams(location.search).get('user');
+  const userId = asUser || store.get('tracebac.user') || crypto.randomUUID();
+  if (!asUser) store.set('tracebac.user', userId);
   let sessionId = store.get('tracebac.session') || crypto.randomUUID();
   store.set('tracebac.session', sessionId);
 
@@ -73,22 +74,27 @@
       if (list) html.push(`</${list}>`);
       list = null;
     };
-    for (const line of text.split('\n')) {
+    const lines = text.split('\n');
+    const kindOf = (line) => (/^\s*[-*•]\s+/.test(line) ? 'ul' : /^\s*\d+[.)]\s+/.test(line) ? 'ol' : null);
+    const nextKind = (from) => {
+      const next = lines.slice(from).find((l) => l.trim());
+      return next === undefined ? null : kindOf(next);
+    };
+    for (const [i, line] of lines.entries()) {
       const bullet = line.match(/^\s*[-*•]\s+(.*)$/);
-      const numbered = line.match(/^\s*\d+[.)]\s+(.*)$/);
-      const item = bullet || numbered;
-      if (item) {
+      const numbered = line.match(/^\s*(\d+)[.)]\s+(.*)$/);
+      if (bullet || numbered) {
         closeParagraph();
         const kind = bullet ? 'ul' : 'ol';
         if (list !== kind) {
           closeList();
-          html.push(`<${kind}>`);
+          html.push(kind === 'ol' ? `<ol start="${numbered[1]}">` : '<ul>');
           list = kind;
         }
-        html.push(`<li>${inline(item[1])}</li>`);
+        html.push(`<li>${inline((bullet || numbered)[bullet ? 1 : 2])}</li>`);
       } else if (!line.trim()) {
         closeParagraph();
-        closeList();
+        if (list !== nextKind(i + 1)) closeList();
       } else {
         closeList();
         paragraph.push(inline(line.trim()));
@@ -104,6 +110,39 @@
     log.append(wrap);
     log.scrollTop = log.scrollHeight;
     return wrap;
+  }
+
+  function sourcesBox(items) {
+    const box = el('div', 'sources');
+    for (const s of items) {
+      if (!/^https?:/.test(s.url)) continue;
+      const day = s.publishedAt ? new Date(s.publishedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }) : '';
+      const link = el('a', '', `[${s.n}] ${new URL(s.url).hostname.replace(/^www\./, '')}${day ? ` · ${day}` : ''}`);
+      link.href = s.url;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.title = s.title;
+      box.append(link);
+    }
+    return box;
+  }
+
+  async function restore() {
+    try {
+      const res = await fetch(`/api/history?sessionId=${encodeURIComponent(sessionId)}&userId=${encodeURIComponent(userId)}`);
+      if (!res.ok) return;
+      const { turns } = await res.json();
+      for (const turn of turns) {
+        addMessage().append(el('div', 'you', turn.userText));
+        const bot = addMessage();
+        const answerEl = el('div', 'text');
+        answerEl.innerHTML = format(turn.answerText);
+        const meta = el('div', 'meta', turn.route ?? '');
+        bot.append(answerEl, meta);
+        if (turn.sources.length) bot.insertBefore(sourcesBox(turn.sources), meta);
+      }
+      log.scrollTop = log.scrollHeight;
+    } catch {}
   }
 
   async function ask(text) {
@@ -151,17 +190,7 @@
           meta.textContent = '';
         }
         if (event.type === 'sources') {
-          const box = el('div', 'sources');
-          for (const s of event.items) {
-            if (!/^https?:/.test(s.url)) continue;
-            const link = el('a', '', `[${s.n}] ${new URL(s.url).hostname.replace(/^www\./, '')}`);
-            link.href = s.url;
-            link.target = '_blank';
-            link.rel = 'noopener noreferrer';
-            link.title = s.title;
-            box.append(link);
-          }
-          bot.insertBefore(box, meta);
+          bot.insertBefore(sourcesBox(event.items), meta);
         }
         if (event.type === 'done') {
           const secs = (event.timings.total / 1000).toFixed(1);
@@ -205,6 +234,8 @@
     log.replaceChildren();
     input.focus();
   });
+
+  restore();
 </script>
 </body>
 </html>

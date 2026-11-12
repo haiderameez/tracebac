@@ -8,8 +8,10 @@
     "node": ">=22.18"
   },
   "scripts": {
+    "predev": "node check-node.mjs",
     "dev": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env src/index.ts",
-    "typecheck": "tsc -p ."
+    "typecheck": "tsc -p .",
+    "replay": "node scripts/replay.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

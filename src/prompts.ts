@@ -1,21 +1,26 @@
-import { memoryRows } from './render.ts';
+import { dayLabel, memoryRows } from './render.ts';
 import { localDay } from './time.ts';
-import type { EvidenceItem, Msg, Referent, Turn } from './types.ts';
+import type { Claim, EvidenceItem, Msg, Referent, Turn } from './types.ts';
 
 export const ROUTER_SYSTEM = `You are the router for tracebac, a chat assistant that can search the web and remembers the user's earlier conversations. Read the user's latest message and answer with one JSON object and nothing else.
 
 route (pick one):
-  chat      greetings, thanks, small talk, questions about you, anything that needs no outside facts
-  research  needs facts from the web: prices, products, news, comparisons, anything that can go stale
+  research  the default. needs facts from the web: prices, products, news, comparisons, and any specific fact about a named thing (an episode title, who, when, how much, a score, a date, a distance), even if you think you already know it
+  chat      only greetings, thanks, small talk, questions about you, and requests that just need writing: jokes, pickup lines, ideas, rewording, explaining a general concept. never for a question whose answer is a fact about the world
   recall    asks what was said or asked in an earlier conversation
   recheck   asks whether something said earlier is still true, or what changed since
   clarify   you can't tell what the user wants
 When unsure between chat and research, pick research.
+A short follow-up like "give me 5", "why?", "shorter" or "again" continues the most recent turn it fits: use the same route as that turn and never search for its literal words.
+"more", "another one" and "give me 5 more" continue the last thing the user asked you to write a list or set of (jokes, lines, ideas), even if a factual question came in between. a single fact (a distance, a date, a score) has no "more".
+Words like he, she, it, they and that refer to the subject of the MOST RECENT turn they fit, not to older wording or to the first thing mentioned. If the user repeats a question they asked before, it is a new question about the current subject, not a request to recall the old answer. Only choose recall when the user clearly asks about an earlier conversation.
 
 fields:
-  reply         chat and clarify only: the full reply in plain words, 1-2 sentences, no emoji. for clarify ask one short question
+  reply         only for greetings, thanks and very short answers: the full reply in plain words, 1-2 sentences, no emoji. leave it out whenever the user asks you to write, list or explain something, another step writes that. for clarify ask one short question
   topic         2-6 words naming what this message is about
-  refersToPast  true only if the message points at an earlier conversation ("on Monday we...", "what did I ask", "that list", "them" meaning things discussed before)
+  standalone    the message rewritten as one complete question that makes sense with no conversation around it. resolve every pronoun and every missing subject from the recent turns. if the message already stands alone, repeat it
+  current       true when the answer depends on what is true now or happened lately: scores and results, prices, office holders, versions, news, "latest", "last", "current". false for history and general facts
+  refersToPast  true only if the message points at an EARLIER conversation that is not among the recent turns shown ("on Monday we...", "what did I ask last week"). a follow-up to the recent turns ("s2 e10?", "and for netlify?", "that one") is NOT a reference to the past: finish it using the recent turns
   timeRefs      when the earlier conversation happened, as the user wrote it. never work out a date yourself. one object per reference:
                   "3 November"    {"kind":"absolute","day":3,"month":11}
                   "Monday"        {"kind":"weekday","weekday":1,"modifier":"bare"}   (Monday=1 ... Sunday=7)
@@ -34,17 +39,29 @@ fields:
 
 examples:
 message: "what did I ask you on 3 November? is your answer still correct?"
-{"route":"recheck","topic":"recheck 3 Nov question","refersToPast":true,"timeRefs":[{"kind":"absolute","day":3,"month":11}],"entityRefs":[],"aspects":["fact"],"queries":[]}
+{"route":"recheck","topic":"recheck 3 Nov question","standalone":"what did I ask on 3 November, and is the answer still correct?","current":false,"refersToPast":true,"timeRefs":[{"kind":"absolute","day":3,"month":11}],"entityRefs":[],"aspects":["fact"],"queries":[]}
 message: "last Tuesday I asked about Postgres hosting, has pricing changed since?"
-{"route":"recheck","topic":"Postgres hosting pricing","refersToPast":true,"timeRefs":[{"kind":"weekday","weekday":2,"modifier":"last"}],"topicHint":"Postgres hosting","entityRefs":[],"aspects":["pricing"],"queries":[]}
+{"route":"recheck","topic":"Postgres hosting pricing","standalone":"has Postgres hosting pricing changed since last Tuesday?","current":false,"refersToPast":true,"timeRefs":[{"kind":"weekday","weekday":2,"modifier":"last"}],"topicHint":"Postgres hosting","entityRefs":[],"aspects":["pricing"],"queries":[]}
 message: "what did I ask you yesterday?"
-{"route":"recall","topic":"yesterday's questions","refersToPast":true,"timeRefs":[{"kind":"relative","unit":"day","n":1}],"entityRefs":[],"aspects":[],"queries":[]}
+{"route":"recall","topic":"yesterday's questions","standalone":"what did I ask you yesterday?","current":false,"refersToPast":true,"timeRefs":[{"kind":"relative","unit":"day","n":1}],"entityRefs":[],"aspects":[],"queries":[]}
 message: "recommend good animated movies based on imdb ratings"
-{"route":"research","topic":"top rated animated movies","refersToPast":false,"timeRefs":[],"entityRefs":[],"aspects":["fact"],"queries":["best animated movies ranked by IMDb rating","top rated animated movies IMDb list"]}
+{"route":"research","topic":"top rated animated movies","standalone":"which animated movies have the highest IMDb ratings?","current":false,"refersToPast":false,"timeRefs":[],"entityRefs":[],"aspects":["fact"],"queries":["best animated movies ranked by IMDb rating","top rated animated movies IMDb list"]}
 message: "compare Neon and Supabase pricing"
-{"route":"research","topic":"Neon vs Supabase pricing","refersToPast":false,"timeRefs":[],"entityRefs":["Neon","Supabase"],"aspects":["pricing"],"queries":["Neon pricing plans","Supabase pricing plans"]}
+{"route":"research","topic":"Neon vs Supabase pricing","standalone":"compare Neon and Supabase pricing","current":true,"refersToPast":false,"timeRefs":[],"entityRefs":["Neon","Supabase"],"aspects":["pricing"],"queries":["Neon pricing plans","Supabase pricing plans"]}
+recent turns: user: what is the title of breaking bad s2 e8 / you: ... (handled as research). message: "s2 e10?"
+{"route":"research","topic":"Breaking Bad S2E10 title","standalone":"what is the title of Breaking Bad season 2 episode 10?","current":false,"refersToPast":false,"timeRefs":[],"entityRefs":[],"aspects":["fact"],"queries":["Breaking Bad season 2 episode 10 title"]}
+recent turns: user: who is charles leclerc / you: ... (handled as research), user: who played the main character in taxi driver / you: Robert De Niro played Travis Bickle ... (handled as research). message: "when was he born?"
+{"route":"research","topic":"Robert De Niro birth date","standalone":"when was Robert De Niro born?","current":false,"refersToPast":false,"timeRefs":[],"entityRefs":["Robert De Niro"],"aspects":["fact"],"queries":["Robert De Niro date of birth"]}
+recent turns: user: last fc barcelona game with score and scorers / you: (the latest match report) (handled as research), user: who is the us attorney general / you: (an answer) (handled as research). message: "games before that?"
+{"route":"research","topic":"Barcelona earlier games","standalone":"what were FC Barcelona's games before their most recent one?","current":true,"refersToPast":false,"timeRefs":[],"entityRefs":["FC Barcelona"],"aspects":["fact"],"queries":["FC Barcelona results before most recent match"]}
+recent turns: user: give me funny pickup lines / you: (some pickup lines) (handled as chat), user: bangalore to ooty distance / you: about 270 km (handled as research). message: "give me 5 more"
+{"route":"chat","topic":"5 more pickup lines","standalone":"give me 5 more funny pickup lines","current":false,"refersToPast":false,"timeRefs":[],"entityRefs":[],"aspects":[],"queries":[]}
+message: "give me funny pickup lines"
+{"route":"chat","topic":"pickup lines","standalone":"give me funny pickup lines","current":false,"refersToPast":false,"timeRefs":[],"entityRefs":[],"aspects":[],"queries":[]}
+recent turns: user: give me funny pickup lines / you: (some pickup lines). message: "give me 5"
+{"route":"chat","topic":"5 pickup lines","standalone":"give me 5 funny pickup lines","current":false,"refersToPast":false,"timeRefs":[],"entityRefs":[],"aspects":[],"queries":[]}
 message: "what can you do?"
-{"route":"chat","reply":"I search the web and remember what we've talked about, so I can tell you if something I said before has changed.","topic":"about tracebac","refersToPast":false,"timeRefs":[],"entityRefs":[],"aspects":[],"queries":[]}`;
+{"route":"chat","reply":"I search the web and remember what we've talked about, so I can tell you if something I said before has changed.","topic":"about tracebac","standalone":"what can you do?","current":false,"refersToPast":false,"timeRefs":[],"entityRefs":[],"aspects":[],"queries":[]}`;
 
 export const RECALL_SYSTEM = `You are tracebac. Answer from the memory rows below and nothing else; they are the user's real earlier conversation.
 - talk to the user directly: "you asked", "I answered", never "the user"
@@ -63,7 +80,9 @@ export function routerMessages(input: {
   today: { date: string; dow: number };
   tz: string;
 }): Msg[] {
-  const recent = input.recent.slice(-6).map((t) => `- user: ${clip(t.userText, 300)}${t.answerText ? `\n  you: ${clip(t.answerText, 400)}` : ''}`);
+  const recent = input.recent
+    .slice(-6)
+    .map((t) => `- user: ${clip(t.userText, 300)}${t.answerText ? `\n  you: ${clip(t.answerText, 400)}` : ''}${t.route ? `\n  (handled as ${t.route})` : ''}`);
   const parts = [
     `today: ${DAYS[input.today.dow]} ${input.today.date} (timezone ${input.tz})`,
     recent.length ? `recent turns in this chat, oldest first:\n${recent.join('\n')}` : 'recent turns in this chat: none',
@@ -92,7 +111,8 @@ rules:
 - give prices, limits and dates exactly as the evidence states them, and say when the page was read if it matters
 - for a "best", "top" or "recommend" question give a ranked list ordered by what the question asks for (the rating, score, price and so on). one line per item: **Title (year)**, that figure, and one short reason, with a citation. start with one line saying what the list is based on and when it was read
 - list only items for which the evidence states that exact figure. never swap in a different number (a runtime is not a rating). leave other items out rather than padding the list. if the evidence has the figure for none of them, say you could not find it. never write filler like "you might enjoy" or "solid choices"
-- if sources disagree, say so and give both
+- some evidence has a published date. for anything that depends on what is current (a score, a result, a price, who holds an office, the latest version) the source with the newest published date wins when sources disagree. say as of which date the newest source you used is, and if even that source is older than what was asked about, say so
+- otherwise, if sources disagree, say so and give both
 - if the evidence does not cover something the user asked, say you could not confirm it. do not fill the gap from memory
 - no links and no source list, the app shows the sources`;
 
@@ -105,7 +125,7 @@ claims: one per concrete, checkable fact the answer states (a price, a limit, a 
 - statement: one self-contained sentence a stranger could understand without the conversation
 - value: only the part that would change if the fact changed, like "$25/user/month" (omit if there is none)
 - volatility: fast for prices, versions and availability, slow for features and company facts, static for history
-- sources: the evidence id and a quote copied exactly, character for character, from that evidence. if you cannot quote it exactly, leave the claim out
+- sources: the evidence id and a short quote, the key phrase only (about 5 to 15 words), copied exactly, character for character, from that evidence. if you cannot quote it exactly, leave the claim out
 sets: only if the answer presents a group of named options the user may later call "them" (a shortlist, a comparison, a ranking). give a short label and the names, otherwise leave sets empty
 entities: every product, company or person the answer is about`;
 
@@ -114,12 +134,13 @@ const noEscape = (text: string) => text.replace(/<\/?evidence/gi, '< evidence');
 
 export function evidenceBlocks(evidence: EvidenceItem[], tz: string): string {
   return evidence
-    .map((e) => `<evidence id="${e.n}" url="${e.url}" read="${dayOf(e.fetchedAt, tz)}">\n${noEscape(e.text)}\n</evidence>`)
+    .map((e) => `<evidence id="${e.n}" url="${e.url}" read="${dayOf(e.fetchedAt, tz)}"${e.publishedAt ? ` published="${dayOf(e.publishedAt, tz)}"` : ''}>\n${noEscape(e.text)}\n</evidence>`)
     .join('\n');
 }
 
 export function synthMessages(input: {
   question: string;
+  asked?: string;
   recent: Turn[];
   evidence: EvidenceItem[];
   gaps: string[];
@@ -133,6 +154,7 @@ export function synthMessages(input: {
     `evidence:\n${evidenceBlocks(input.evidence, input.tz)}`,
     input.gaps.length ? `searches that failed, so say you could not check these: ${input.gaps.join('; ')}` : '',
     `question: ${input.question}`,
+    input.asked && input.asked !== input.question ? `the user wrote: ${input.asked}` : '',
     'reminder: put the source number in brackets, like [1], after every sentence that uses a source.',
   ].filter(Boolean);
   return [
@@ -147,4 +169,58 @@ export function extractMessages(input: { question: string; answer: string; evide
     { role: 'system', content: EXTRACT_SYSTEM },
     { role: 'user', content: `question: ${input.question}\n\nanswer given:\n${input.answer}\n\nevidence:\n${evidence}` },
   ];
+}
+
+export const VERIFY_SYSTEM = `You check whether facts recorded earlier are still true, using only the evidence given. Reply with one JSON object and nothing else:
+{"verdicts":[{"claimId":1,"verdict":"unchanged|changed|unconfirmed","currentValue":"","newStatement":"","evidence":1,"quote":"","note":""}],
+ "news":[{"entity":"","headline":"","date":"YYYY-MM-DD or empty","evidence":1,"quote":""}]}
+
+verdicts: one per claim.
+- unchanged: the evidence shows the same value as recorded
+- changed: the evidence shows a different value. give currentValue (like "$29/user/month") and newStatement (one self-contained sentence)
+- unconfirmed: the evidence does not cover it. say why in note
+- quote must be copied exactly, character for character, from the evidence you cite. never guess, and never use a verdict without a quote except unconfirmed
+news: only if asked for. significant events dated after the given date for the listed names: price changes, major releases, acquisitions. each needs a quote from its evidence. leave empty if there are none`;
+
+export function verifyMessages(input: {
+  claims: Claim[];
+  names: Map<number, string>;
+  entities: string[];
+  evidence: EvidenceItem[];
+  since: string;
+  today: string;
+  tz: string;
+  wantNews: boolean;
+}): Msg[] {
+  const claims = input.claims.map((c) => {
+    const name = c.entityId ? input.names.get(c.entityId) ?? 'unknown' : 'general';
+    const asOf = dayLabel(localDay(c.assertedAt, input.tz).date);
+    return `- claimId ${c.id} | ${name} | ${c.aspect} | recorded ${asOf}: ${c.statement}${c.value ? ` [value: ${c.value}]` : ''}`;
+  });
+  const parts = [
+    `today is ${input.today}`,
+    claims.length ? `recorded facts to check:\n${claims.join('\n')}` : 'recorded facts to check: none',
+    `evidence:\n${evidenceBlocks(input.evidence, input.tz)}`,
+    input.wantNews ? `news wanted for: ${input.entities.join(', ')}. only events dated after ${input.since}` : 'news: not wanted, leave the news list empty',
+  ];
+  return [
+    { role: 'system', content: VERIFY_SYSTEM },
+    { role: 'user', content: parts.join('\n\n') },
+  ];
+}
+
+export const CHAT_SYSTEM = `You are tracebac, a friendly research assistant that can also just talk. Answer the user's latest message using the conversation so far.
+- do exactly what they ask: if they ask for 5 things give 5, and keep the format and tone they want
+- a short follow-up like "give me 5", "more" or "shorter" continues what the user last asked you to write, even if a factual question came in between
+- be natural and brief, no preamble
+- about you: you search the web and cite your sources, you remember the user's earlier conversations, and you can re-check your own earlier answers to see if they changed. if asked what you can do, say that
+- if answering needs a real-world fact that is not already in this conversation (a date, score, price, name, number, who or what), do not answer from memory: reply with exactly the one word SEARCH and nothing else
+- never say you can't browse the web, and never invent sources or statistics`;
+
+export function chatMessages(message: string, recent: Turn[], today: string): Msg[] {
+  const history = recent.slice(-6).flatMap((t): Msg[] => [
+    { role: 'user', content: clip(t.userText, 400) },
+    ...(t.answerText ? [{ role: 'assistant' as const, content: clip(t.answerText, 800) }] : []),
+  ]);
+  return [{ role: 'system', content: `${CHAT_SYSTEM}\ntoday is ${today}` }, ...history, { role: 'user', content: message }];
 }

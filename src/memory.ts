@@ -2,9 +2,10 @@ import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { canon } from './text.ts';
 import { localDay, safeTz } from './time.ts';
 import type {
-  Claim, DateCandidates, DateRange, Entity, EntitySet, Evidence, Extraction, ExtractionResult, Referent, Route, Turn,
+  Claim, DateCandidates, DateRange, Entity, EntitySet, Evidence, Extraction, ExtractionResult, HistoryTurn, Referent, Route, Turn, VerdictRecord,
 } from './types.ts';
 
 type Row = Record<string, any>;
@@ -132,6 +133,24 @@ export class Memory {
     ).map(mapTurn);
   }
 
+  sessionHistory(sessionId: string, userId: string, limit = 100): HistoryTurn[] {
+    const turns = this.all(
+      `SELECT * FROM (SELECT * FROM turns WHERE session_id=? AND user_id=? AND ${REFERENCEABLE} ORDER BY asked_at DESC, id DESC LIMIT ?)
+       ORDER BY asked_at, id`, sessionId, userId, limit,
+    ).map(mapTurn);
+    return turns.map((t) => {
+      const answer = t.answerText ?? '';
+      const cited = new Set([...answer.matchAll(/\[(\d{1,2}(?:, \d{1,2})*)\]/g)].flatMap((m) => m[1].split(', ').map(Number)));
+      const sources = t.route === 'research'
+        ? this.evidenceFor(t.id)
+            .map((e, i) => ({ n: i + 1, url: e.url, title: e.title ?? e.url, checkedAt: e.fetchedAt, publishedAt: e.publishedAt ?? undefined }))
+            .filter((s) => !cited.size || cited.has(s.n))
+            .slice(0, 8)
+        : [];
+      return { id: t.id, userText: t.userText, answerText: answer, route: t.route, askedAt: t.askedAt, sources };
+    });
+  }
+
   threadIndex(userId: string, limit: number): string[] {
     const turns = this.all(
       `SELECT * FROM (SELECT * FROM turns WHERE user_id=? AND status IN ('done','aborted') ORDER BY asked_at DESC, id DESC LIMIT ?)
@@ -180,7 +199,7 @@ export class Memory {
         this.run('INSERT OR IGNORE INTO turn_entities(turn_id, entity_id) VALUES (?,?)', turnId, entityId);
 
       const ev = new Map<string, { id: number; chunk: string }>();
-      for (const e of x.evidence) ev.set(e.key, { id: this.insertEvidence(turnId, e), chunk: norm(e.chunk) });
+      for (const e of x.evidence) ev.set(e.key, { id: this.insertEvidence(turnId, e), chunk: canon(e.chunk) });
 
       for (const e of x.entities) link(this.upsertEntity(turn.userId, e));
 
@@ -188,7 +207,7 @@ export class Memory {
         const entityId = c.entity ? this.upsertEntity(turn.userId, { name: c.entity }) : null;
         if (entityId) link(entityId);
         const sources = c.sources.filter((s) => {
-          const q = norm(s.quote);
+          const q = canon(s.quote);
           return q.length > 0 && !!ev.get(s.evidence)?.chunk.includes(q);
         });
         const status = sources.length ? 'active' : 'unverifiable';
@@ -267,13 +286,16 @@ export class Memory {
 
     const nearest = this.nearest(userId, q.dates?.primary.from ?? null);
     if (!turns.length) return { match: 'none', turns: [], sets: [], entities: [], claims: [], nearest };
+    return this.assemble(userId, turns, match, nearest, resolvedRange);
+  }
 
-    return {
-      match, resolvedRange, turns, nearest,
-      entities: this.entitiesFor(turns.map((t) => t.id)),
-      claims: this.claimsFor(turns.map((t) => t.id)),
-      sets: this.setsFor(userId, turns),
-    };
+  referentOfTurn(userId: string, turn: Turn): Referent {
+    return this.assemble(userId, [turn], 'exact', [], { from: turn.localDate, to: turn.localDate });
+  }
+
+  private assemble(userId: string, turns: Turn[], match: Referent['match'], nearest: Referent['nearest'], resolvedRange?: DateRange): Referent {
+    const ids = turns.map((t) => t.id);
+    return { match, resolvedRange, turns, nearest, entities: this.entitiesFor(ids), claims: this.claimsFor(ids), sets: this.setsFor(userId, turns) };
   }
 
   private turnsInRange(userId: string, r: DateRange): Turn[] {
@@ -340,14 +362,50 @@ export class Memory {
   }
 
   private claimsFor(turnIds: number[]): Claim[] {
-    return this.all(`SELECT * FROM claims WHERE turn_id IN ${inList(turnIds)} ORDER BY id`, ...turnIds).map((r) => ({
+    return this.hydrateClaims(this.all(`SELECT * FROM claims WHERE turn_id IN ${inList(turnIds)} ORDER BY id`, ...turnIds));
+  }
+
+  activeClaims(userId: string, entityIds: number[]): Claim[] {
+    if (!entityIds.length) return [];
+    return this.hydrateClaims(this.all(
+      `SELECT * FROM claims WHERE user_id=? AND entity_id IN ${inList(entityIds)} AND status IN ('active','unverifiable')
+       ORDER BY entity_id, asserted_at, id`, userId, ...entityIds,
+    ));
+  }
+
+  private hydrateClaims(rows: Row[]): Claim[] {
+    return rows.map((r) => ({
       id: r.id, turnId: r.turn_id, entityId: r.entity_id, aspect: r.aspect, statement: r.statement, value: r.value,
       volatility: r.volatility, assertedAt: r.asserted_at, supersedes: r.supersedes, status: r.status,
       lastCheckedAt: r.last_checked_at, lastVerdict: r.last_verdict,
       sources: this.all(
-        `SELECT e.*, ce.quote, ce.stance FROM claim_evidence ce JOIN evidence e ON e.id = ce.evidence_id WHERE ce.claim_id=?`, r.id,
+        `SELECT e.*, ce.quote, ce.stance FROM claim_evidence ce JOIN evidence e ON e.id = ce.evidence_id
+         WHERE ce.claim_id=? ORDER BY ce.rowid`, r.id,
       ).map((s) => ({ evidence: mapEvidence(s), quote: s.quote, stance: s.stance })),
     }));
+  }
+
+  recordVerdicts(turnId: number, checkedAt: number, items: VerdictRecord[]) {
+    this.tx(() => {
+      for (const item of items) {
+        const old = this.one('SELECT * FROM claims WHERE id=?', item.claimId);
+        if (!old) continue;
+        const evidenceId = item.evidence ? this.insertEvidence(turnId, item.evidence) : undefined;
+        this.run('UPDATE claims SET last_checked_at=?, last_verdict=? WHERE id=?', checkedAt, item.verdict, item.claimId);
+
+        if (item.verdict === 'changed' && item.newStatement) {
+          const id = Number(this.run(
+            `INSERT INTO claims(turn_id, user_id, entity_id, aspect, statement, value, volatility, asserted_at, supersedes, status, last_checked_at, last_verdict)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+            turnId, old.user_id, old.entity_id, old.aspect, item.newStatement, item.currentValue ?? null, old.volatility, checkedAt, old.id, 'active', checkedAt, 'unchanged',
+          ).lastInsertRowid);
+          this.run(`UPDATE claims SET status='superseded' WHERE id=?`, old.id);
+          if (evidenceId && item.quote) this.run('INSERT OR IGNORE INTO claim_evidence(claim_id, evidence_id, quote, stance) VALUES (?,?,?,?)', id, evidenceId, item.quote, 'supports');
+        } else if (item.verdict === 'unchanged' && evidenceId && item.quote) {
+          this.run('INSERT OR IGNORE INTO claim_evidence(claim_id, evidence_id, quote, stance) VALUES (?,?,?,?)', item.claimId, evidenceId, item.quote, 'supports');
+        }
+      }
+    });
   }
 
   private setsFor(userId: string, turns: Turn[]): EntitySet[] {

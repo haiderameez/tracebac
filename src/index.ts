@@ -32,6 +32,21 @@ const web = createWebSearch({
 });
 const server = createApp({ clock: systemClock, memory, llm, web, background: new Background(), log: (message) => console.warn(`[ledger] ${message}`), allowClockOverride: config.allowClockOverride });
 
+server.on('error', (e: NodeJS.ErrnoException) => {
+  console.error(e.code === 'EADDRINUSE' ? `port ${config.port} is already in use. stop what is using it, or set PORT in .env` : `could not start the server: ${e.message}`);
+  process.exit(1);
+});
+
+for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+  process.on(signal, () => {
+    server.close();
+    memory.close();
+    process.exit(0);
+  });
+}
+
+process.on('unhandledRejection', (reason) => console.error('[unhandled]', reason));
+
 server.listen(config.port, () => {
   console.log(`tracebac running on http://localhost:${config.port}`);
   for (const [role, slots] of Object.entries(CHAINS)) {

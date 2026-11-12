@@ -116,15 +116,15 @@ export function selectChunks(
     .map(({ page: _page, order: _order, ...chunk }) => chunk);
 }
 
-const lenient = <T extends z.ZodType>(schema: T) =>
-  z.array(z.unknown()).nullish().transform((items) =>
-    (items ?? []).flatMap((item) => {
+export const lenient = <T extends z.ZodType>(schema: T) =>
+  z.unknown().optional().transform((items) =>
+    (Array.isArray(items) ? items : []).flatMap((item) => {
       const parsed = schema.safeParse(item);
       return parsed.success ? [parsed.data as z.output<T>] : [];
     }),
   );
 
-const optional = z.string().nullish().transform((v) => v?.trim() || undefined);
+export const optional = z.string().nullish().transform((v) => v?.trim() || undefined);
 
 const EntityIn = z.object({
   name: z.string().min(1),
@@ -173,8 +173,9 @@ export async function extract(
   llm: LLM,
   input: { question: string; answer: string; evidence: EvidenceItem[] },
   signal?: AbortSignal,
+  reserve = BACKGROUND_RESERVE,
 ): Promise<Extraction> {
-  const result = await llm.object('structure', extractMessages(input), ExtractSchema, { signal, reserve: BACKGROUND_RESERVE });
+  const result = await llm.object('structure', extractMessages(input), ExtractSchema, { signal, reserve });
   if (!result.ok) throw new Error(result.error);
 
   return {

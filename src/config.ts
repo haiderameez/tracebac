@@ -62,14 +62,11 @@ const groq = (model: string, role: Role): Slot => ({
   model,
   extra: { temperature: 0.2, reasoning_effort: 'low', include_reasoning: false, max_completion_tokens: OUTPUT_CAP[role] },
 });
-const cerebras = (model: string, role: Role): Slot => {
-  const oss = model === 'gpt-oss-120b';
-  return {
-    provider: 'cerebras',
-    model,
-    extra: { temperature: 0.2, max_completion_tokens: OUTPUT_CAP[role] * (oss ? 1 : 2), ...(oss ? { reasoning_effort: 'low' } : {}) },
-  };
-};
+const cerebras = (model: string, role: Role): Slot => ({
+  provider: 'cerebras',
+  model,
+  extra: { temperature: 0.2, reasoning_effort: 'low', max_completion_tokens: OUTPUT_CAP[role] },
+});
 const gemini = (model: string): Slot => ({ provider: 'gemini', model, extra: { reasoning_effort: 'low' } });
 
 export const CHAINS: Record<Role, Slot[]> = {
@@ -116,6 +113,8 @@ export const BUDGET = {
   evidenceTokens: 4000,
   maxChunks: 10,
   chunkChars: 1200,
+  freshDays: 30,
+  freshVariants: 2,
   readWant: 3,
   readGraceMs: 2500,
   extractRetryMs: 15000,

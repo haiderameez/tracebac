@@ -13,6 +13,8 @@ const Body = z.object({
   now: z.number().optional(),
 });
 
+const Ids = z.object({ sessionId: z.string().min(1).max(80), userId: z.string().min(1).max(80) });
+
 const PAGE = new URL('../public/index.html', import.meta.url);
 const MAX_BODY = 64 * 1024;
 
@@ -63,8 +65,14 @@ export function createApp(deps: Deps & { allowClockOverride: boolean }): Server 
   }
 
   return createServer(async (req, res) => {
-    const path = (req.url ?? '/').split('?')[0];
+    const [path, query] = (req.url ?? '/').split('?');
     try {
+      if (req.method === 'GET' && path === '/api/health') return json(res, 200, { ok: true, clockOverride: deps.allowClockOverride });
+      if (req.method === 'GET' && path === '/api/history') {
+        const ids = Ids.safeParse(Object.fromEntries(new URLSearchParams(query)));
+        if (!ids.success) return json(res, 400, { error: 'send ?sessionId=...&userId=...' });
+        return json(res, 200, { turns: deps.memory.sessionHistory(ids.data.sessionId, ids.data.userId) });
+      }
       if (req.method === 'GET' && (path === '/' || path === '/index.html')) {
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
         return res.end(await readFile(PAGE));

@@ -58,6 +58,15 @@ export interface Evidence {
   via: 'page' | 'snippet';
 }
 
+export interface HistoryTurn {
+  id: number;
+  userText: string;
+  answerText: string;
+  route: Route | null;
+  askedAt: number;
+  sources: { n: number; url: string; title: string; checkedAt: number; publishedAt?: number }[];
+}
+
 export interface Claim {
   id: number;
   turnId: number;
@@ -119,6 +128,8 @@ export interface Intent {
   route: 'chat' | 'recall' | 'recheck' | 'research' | 'clarify';
   reply?: string;
   topic: string;
+  standalone?: string;
+  current: boolean;
   refersToPast: boolean;
   timeRefs: TimeRef[];
   topicHint?: string;
@@ -131,7 +142,7 @@ export type TurnEvent =
   | { type: 'status'; text: string }
   | { type: 'recall'; label: string; quotes: string[]; entities: string[] }
   | { type: 'delta'; text: string }
-  | { type: 'sources'; items: { n: number; url: string; title: string; checkedAt: number }[] }
+  | { type: 'sources'; items: { n: number; url: string; title: string; checkedAt: number; publishedAt?: number }[] }
   | { type: 'done'; turnId: number; route: Route | null; timings: Record<string, number> };
 
 export interface EvidenceItem {
@@ -142,4 +153,13 @@ export interface EvidenceItem {
   via: 'page' | 'snippet';
   fetchedAt: number;
   publishedAt?: number;
+}
+
+export interface VerdictRecord {
+  claimId: number;
+  verdict: Verdict;
+  evidence?: Extraction['evidence'][number];
+  quote?: string;
+  currentValue?: string;
+  newStatement?: string;
 }
