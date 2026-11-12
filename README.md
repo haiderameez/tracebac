@@ -2,6 +2,10 @@
 
 A chat agent whose only tool is web search. It answers with cited sources, remembers what you asked and when, and can check whether its own earlier answers still hold ("has any of that changed since Monday?"). The thinking behind it is in [DESIGN.md](DESIGN.md).
 
+**Live demo:** https://tracebac.onrender.com/
+
+This demo is only here for your convenience, so you can try the agent without setting up API keys. It runs on Render's free plan. Render puts a free service to sleep after 15 minutes with no visitors, and waking it up takes about a minute, so the first page load may be slow. Free services also only get temporary storage, so when it sleeps, restarts or redeploys, the saved chats are wiped and the memory starts empty. Questions about earlier days work best when you run it yourself (see below).
+
 ## Run it
 
 You need Node 22.18 or newer and two free API keys. None of them needs a credit card. One key is for a model and one is for search.
